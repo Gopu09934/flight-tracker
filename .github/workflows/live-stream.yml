@@ -1,0 +1,92 @@
+name: 24/7 YouTube live stream
+
+# GitHub-hosted runners are capped at ~6 hours per job, so true 24/7 uptime
+# is achieved by chaining sessions: each run streams for ~5h50m, and a new
+# run is scheduled to pick up right after (there will be a short reconnect
+# gap of roughly a minute between sessions while the next job boots).
+#
+# Required repo secret:
+#   YOUTUBE_STREAM_KEY   -> from YouTube Studio > Go Live > Stream key
+#
+# Optional secrets (raise the OpenSky rate limit):
+#   OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'     # kicks off a new ~5h50m session every 6 hours
+  workflow_dispatch: {}
+
+concurrency:
+  group: live-stream
+  cancel-in-progress: false
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
+            libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 || \
+          sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
+            libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2
+
+      - name: Install Node dependencies
+        run: npm install puppeteer@22 http-server@14
+
+      - name: Prime initial flight snapshot
+        env:
+          OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
+        run: node scripts/fetch-flights.js || true
+
+      - name: Start virtual display
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
+          sleep 2
+          echo "DISPLAY=:99" >> "$GITHUB_ENV"
+
+      - name: Start static server
+        run: |
+          npx http-server . -p 8080 -s &
+          sleep 2
+
+      - name: Start background flight-data poller
+        env:
+          OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
+        run: |
+          chmod +x scripts/poll-loop.sh
+          nohup scripts/poll-loop.sh 20 > poll.log 2>&1 &
+
+      - name: Launch dashboard in Chromium
+        run: |
+          nohup node scripts/launch-browser.js > browser.log 2>&1 &
+          sleep 8
+
+      - name: Stream to YouTube via ffmpeg
+        env:
+          YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+        run: |
+          if [ -z "${YOUTUBE_STREAM_KEY}" ]; then
+            echo "::error::YOUTUBE_STREAM_KEY secret is not set. Add it in Settings > Secrets > Actions."
+            exit 1
+          fi
+          # Session length in seconds, kept under the job's timeout-minutes budget.
+          DURATION=$((5*3600 + 40*60))
+          ffmpeg -nostdin \
+            -f x11grab -video_size 1920x1080 -framerate 30 -i :99.0 \
+            -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+            -c:v libx264 -preset veryfast -tune zerolatency \
+            -b:v 4500k -maxrate 4500k -bufsize 9000k -pix_fmt yuv420p -g 60 \
+            -c:a aac -b:a 128k -ar 44100 \
+            -t "${DURATION}" \
+            -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
