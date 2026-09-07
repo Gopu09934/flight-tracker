@@ -162,6 +162,11 @@
   .plane-rot svg{ display:block; overflow:visible; }
 
   .leaflet-marker-icon{ transition: transform 0.85s linear; }
+  .country-label{
+    color:#5d7599; font-family:var(--mono); font-size:10px; letter-spacing:0.06em;
+    text-transform:uppercase; white-space:nowrap; pointer-events:none;
+    transform:translate(-50%,-50%); text-shadow:0 1px 2px rgba(0,0,0,0.8);
+  }
 
   .leaflet-popup-content-wrapper{ background:var(--panel-solid); color:var(--text); border:1px solid var(--line-strong); border-radius:10px; }
   .leaflet-popup-tip{ background:var(--panel-solid); }
@@ -299,6 +304,61 @@ function applyRasterFallback(){
   }).addTo(map);
 }
 
+// Labeling all 258 countries at world zoom is unreadable clutter, so only
+// this curated set of large/well-known countries gets a name label.
+const LABELED_COUNTRIES = new Set([
+  'United States of America','Canada','Mexico','Brazil','Argentina','Peru','Colombia','Venezuela','Chile','Bolivia',
+  'United Kingdom','France','Germany','Spain','Portugal','Italy','Poland','Ukraine','Russia','Sweden','Norway','Finland',
+  'Turkey','Egypt','Nigeria','South Africa','Kenya','Ethiopia','Democratic Republic of the Congo','Algeria','Libya','Morocco',
+  'Saudi Arabia','Iran','Iraq','India','Pakistan','China','Mongolia','Kazakhstan','Japan','South Korea','North Korea','Vietnam',
+  'Thailand','Indonesia','Philippines','Malaysia','Australia','New Zealand','Greenland',
+]);
+
+function ringArea(ring){
+  let a = 0;
+  for(let i=0; i<ring.length; i++){
+    const [x1,y1] = ring[i], [x2,y2] = ring[(i+1)%ring.length];
+    a += x1*y2 - x2*y1;
+  }
+  return Math.abs(a)/2;
+}
+
+// Picks the largest sub-polygon's bbox center, so a label lands on a
+// country's mainland instead of drifting into the ocean between it and
+// small outlying territories (French Guiana, Alaska, etc.).
+function largestRingCenter(geometry){
+  const polygons = geometry.type==='Polygon' ? [geometry.coordinates]
+    : geometry.type==='MultiPolygon' ? geometry.coordinates : null;
+  if(!polygons) return null;
+
+  let best=null, bestArea=-1;
+  polygons.forEach(poly=>{
+    const area = ringArea(poly[0]);
+    if(area>bestArea){ bestArea=area; best=poly[0]; }
+  });
+  if(!best) return null;
+
+  let minLon=Infinity, maxLon=-Infinity, minLat=Infinity, maxLat=-Infinity;
+  best.forEach(([lon,lat])=>{
+    if(lon<minLon) minLon=lon; if(lon>maxLon) maxLon=lon;
+    if(lat<minLat) minLat=lat; if(lat>maxLat) maxLat=lat;
+  });
+  return [(minLat+maxLat)/2, (minLon+maxLon)/2];
+}
+
+function addCountryLabels(geo){
+  geo.features.forEach(f=>{
+    const name = f.properties && f.properties.name;
+    if(!name || !LABELED_COUNTRIES.has(name)) return;
+    const center = largestRingCenter(f.geometry);
+    if(!center) return;
+    L.marker(center, {
+      pane:'countries', interactive:false,
+      icon: L.divIcon({ className:'country-label', html:name, iconSize:null }),
+    }).addTo(map);
+  });
+}
+
 fetch(COUNTRIES_URL)
   .then(res=>{ if(!res.ok) throw new Error('geojson http '+res.status); return res.json(); })
   .then(geo=>{
@@ -307,6 +367,7 @@ fetch(COUNTRIES_URL)
       renderer:L.canvas({ padding:0.4 }),
       style:{ color:'#3c5077', weight:0.6, fillColor:'#1b2c48', fillOpacity:1 },
     }).addTo(map);
+    addCountryLabels(geo);
   })
   .catch(err=>{
     console.warn('Country GeoJSON unavailable, using raster fallback:', err.message);
@@ -655,6 +716,30 @@ refresh();
 setInterval(refresh, FETCH_MS);
 setInterval(updateStats, 2000);
 setInterval(updateFlightList, 4000);
+
+/* ---------- Cinematic camera: slow zoom/pan cycle so the stream isn't a
+   frozen world view. Kept infrequent + short so the animation itself
+   doesn't compete with the encoder for CPU. ---------- */
+const CAMERA_SCENES = [
+  { center:[25, 15],   zoom:3 },  // world overview
+  { center:[48, 12],   zoom:5 },  // Europe
+  { center:[39, -98],  zoom:4 },  // North America
+  { center:[20, 78],   zoom:4 },  // South Asia
+  { center:[35, 105],  zoom:4 },  // East Asia
+  { center:[-15, -55], zoom:4 },  // South America
+];
+const CAMERA_FLY_SEC = 3.5;
+const CAMERA_DWELL_MS = 22000;
+let cameraIndex = 0;
+
+function cycleCamera(){
+  cameraIndex = (cameraIndex + 1) % CAMERA_SCENES.length;
+  const scene = CAMERA_SCENES[cameraIndex];
+  map.flyTo(scene.center, scene.zoom, { duration: CAMERA_FLY_SEC });
+  setTimeout(cycleCamera, CAMERA_DWELL_MS);
+}
+setTimeout(cycleCamera, CAMERA_DWELL_MS);
+
 </script>
 </body>
 </html>
