@@ -6,8 +6,8 @@
 const puppeteer = require('puppeteer');
 
 const URL = process.env.DASHBOARD_URL || 'http://localhost:8080/index.html';
-const WIDTH = 1920;
-const HEIGHT = 1080;
+const WIDTH = 1280;
+const HEIGHT = 720;
 
 (async () => {
   const browser = await puppeteer.launch({
