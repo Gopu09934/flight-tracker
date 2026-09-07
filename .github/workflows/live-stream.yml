@@ -50,7 +50,7 @@ jobs:
 
       - name: Start virtual display
         run: |
-          Xvfb :99 -screen 0 1280x720x24 -nolisten tcp &
+          Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp &
           sleep 2
           echo "DISPLAY=:99" >> "$GITHUB_ENV"
 
@@ -83,10 +83,10 @@ jobs:
           # Session length in seconds, kept under the job's timeout-minutes budget.
           DURATION=$((5*3600 + 40*60))
           ffmpeg -nostdin \
-            -f x11grab -video_size 1280x720 -framerate 30 -i :99.0 \
+            -f x11grab -draw_mouse 0 -video_size 1920x1080 -framerate 24 -i :99.0 \
             -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
             -c:v libx264 -preset ultrafast -tune zerolatency \
-            -b:v 2500k -maxrate 2500k -bufsize 5000k -pix_fmt yuv420p -g 60 \
+            -b:v 4000k -maxrate 4000k -bufsize 8000k -pix_fmt yuv420p -g 48 \
             -c:a aac -b:a 128k -ar 44100 \
             -t "${DURATION}" \
             -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
