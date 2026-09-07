@@ -269,6 +269,10 @@
 
 const FETCH_MS = 15000;
 const MOVE_TICK_MS = 400;
+// Real-world velocity is ~1 px/many-seconds at this whole-earth zoom level,
+// so it reads as static. This scales only the on-screen glide rate;
+// reported speed/altitude/heading in the stats panel and popups stay real.
+const MOVE_VISUAL_SCALE = 18;
 const OPEN_SKY_URL = 'https://opensky-network.org/api/states/all';
 const CORS_RELAY = 'https://corsproxy.io/?url=';
 const LOCAL_DATA_URL = './data/flights.json';
@@ -482,7 +486,7 @@ setInterval(()=>{
       }
     }
 
-    const [nlat, nlon] = advance(f.lat, f.lon, f.heading, f.velocity*dt);
+    const [nlat, nlon] = advance(f.lat, f.lon, f.heading, f.velocity*dt*MOVE_VISUAL_SCALE);
     f.lat = nlat; f.lon = nlon;
     f.marker.setLatLng([nlat, nlon]);
   }
