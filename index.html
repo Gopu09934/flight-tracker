@@ -161,7 +161,7 @@
   }
   .plane-rot svg{ display:block; overflow:visible; }
 
-  .leaflet-marker-icon{ transition: transform 0.45s linear; }
+  .leaflet-marker-icon{ transition: transform 0.75s linear; }
 
   .leaflet-popup-content-wrapper{ background:var(--panel-solid); color:var(--text); border:1px solid var(--line-strong); border-radius:10px; }
   .leaflet-popup-tip{ background:var(--panel-solid); }
@@ -268,11 +268,15 @@
    ========================================================= */
 
 const FETCH_MS = 15000;
-const MOVE_TICK_MS = 400;
+const MOVE_TICK_MS = 800;
 // Real-world velocity is ~1 px/many-seconds at this whole-earth zoom level,
 // so it reads as static. This scales only the on-screen glide rate;
 // reported speed/altitude/heading in the stats panel and popups stay real.
 const MOVE_VISUAL_SCALE = 18;
+// Rendering every tracked aircraft as its own DOM marker (~12k+ globally)
+// is what was starving the encoder of CPU. Capping keeps the "busy sky"
+// look without the per-tick repaint cost of thousands of nodes.
+const MAX_RENDERED_FLIGHTS = 1200;
 const OPEN_SKY_URL = 'https://opensky-network.org/api/states/all';
 const CORS_RELAY = 'https://corsproxy.io/?url=';
 const LOCAL_DATA_URL = './data/flights.json';
@@ -496,7 +500,7 @@ setInterval(()=>{
 function updateStats(){
   const all = [...live.values()];
   const airborne = all.filter(f=>!f.on_ground && f.altitude!=null);
-  const count = all.length;
+  const count = lastRawCount || all.length;
   const avgAlt = airborne.length ? Math.round(airborne.reduce((a,f)=>a+f.altitude,0)/airborne.length) : 0;
   const avgSpeed = airborne.length ? Math.round(airborne.reduce((a,f)=>a+(f.velocity||0),0)/airborne.length*3.6) : 0;
   const countries = new Set(all.map(f=>f.country).filter(Boolean)).size;
@@ -538,6 +542,7 @@ function updateTicker(){
 
 /* ---------- Data sources ---------- */
 let lastSource = 'INITIALIZING';
+let lastRawCount = 0;
 
 async function fetchLocalSnapshot(){
   const res = await fetch(LOCAL_DATA_URL, {cache:'no-store'});
@@ -630,11 +635,14 @@ async function refresh(){
   }
 
   if(flights && flights.length){
-    const ids = new Set(flights.map(f=>f.icao24));
-    flights.forEach(upsertFlight);
+    lastRawCount = flights.length;
+    const rendered = flights.length > MAX_RENDERED_FLIGHTS ? flights.slice(0, MAX_RENDERED_FLIGHTS) : flights;
+    const ids = new Set(rendered.map(f=>f.icao24));
+    rendered.forEach(upsertFlight);
     removeStale(ids);
   } else {
     ensureSimFleet();
+    lastRawCount = live.size;
   }
 
   updateStats();
