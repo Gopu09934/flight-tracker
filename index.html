@@ -538,6 +538,7 @@ function removeStale(keepIds){
 
 /* ---------- Dead-reckoning tick: gives continuous, lifelike motion ---------- */
 setInterval(()=>{
+  if(cameraInFlight) return; // avoid contending with the camera pan/zoom animation
   const dt = MOVE_TICK_MS/1000;
   for(const [id, f] of live){
     if(f.on_ground || !f.velocity) continue;
@@ -728,14 +729,17 @@ const CAMERA_SCENES = [
   { center:[35, 105],  zoom:4 },  // East Asia
   { center:[-15, -55], zoom:4 },  // South America
 ];
-const CAMERA_FLY_SEC = 3.5;
+const CAMERA_FLY_SEC = 6;
 const CAMERA_DWELL_MS = 22000;
 let cameraIndex = 0;
+let cameraInFlight = false;
 
 function cycleCamera(){
   cameraIndex = (cameraIndex + 1) % CAMERA_SCENES.length;
   const scene = CAMERA_SCENES[cameraIndex];
-  map.flyTo(scene.center, scene.zoom, { duration: CAMERA_FLY_SEC });
+  cameraInFlight = true;
+  map.flyTo(scene.center, scene.zoom, { duration: CAMERA_FLY_SEC, easeLinearity: 0.15 });
+  setTimeout(()=>{ cameraInFlight = false; }, CAMERA_FLY_SEC*1000);
   setTimeout(cycleCamera, CAMERA_DWELL_MS);
 }
 setTimeout(cycleCamera, CAMERA_DWELL_MS);
