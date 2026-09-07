@@ -1,60 +1,660 @@
-// scripts/launch-browser.js
-// Opens the dashboard in a real (non-headless) Chromium window on the
-// virtual display (:99, started by Xvfb in the workflow) so ffmpeg's
-// x11grab can capture it as the video source for the YouTube stream.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>GLOBAL FLIGHT TRACKER — LIVE</title>
+<meta name="description" content="Live 24/7 global flight tracking dashboard" />
 
-const puppeteer = require('puppeteer');
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 
-const URL = process.env.DASHBOARD_URL || 'http://localhost:8080/index.html';
-const WIDTH = 1920;
-const HEIGHT = 1080;
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 
-(async () => {
-  const browser = await puppeteer.launch({
-    headless: false,
-    executablePath: puppeteer.executablePath(),
-    args: [
-      '--kiosk',
-      `--window-size=${WIDTH},${HEIGHT}`,
-      '--window-position=0,0',
-      '--disable-infobars',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--autoplay-policy=no-user-gesture-required',
-      '--disable-dev-shm-usage',
-      '--disable-gpu-shader-disk-cache',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--use-gl=swiftshader',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-    ],
-    defaultViewport: null,
+<style>
+  :root{
+    --void:        #05070c;
+    --panel:       #0b1220ee;
+    --panel-solid: #0c1322;
+    --panel-alt:   #101a2c;
+    --line:        rgba(160,185,225,0.10);
+    --line-strong: rgba(160,185,225,0.20);
+    --amber:       #ff9a3d;
+    --amber-dim:   #a3672c;
+    --cyan:        #4fd8e0;
+    --cyan-dim:    #2f7f85;
+    --red:         #ff4d5e;
+    --green:       #37d67a;
+    --ground:      #8a97b3;
+    --land:        #1b2c48;
+    --land-line:   #3c5077;
+    --text:        #e9eefb;
+    --text-mid:    #9aa7c2;
+    --text-dim:    #5c6883;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    --disp: 'Space Grotesk', sans-serif;
+  }
+
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:var(--void);
+    color:var(--text);
+    font-family:var(--disp);
+    overflow:hidden;
+  }
+
+  #map{ position:absolute; inset:0; z-index:1; background:var(--void); }
+  .leaflet-container{
+    background: radial-gradient(ellipse at 50% 50%, #0a1220 0%, #05070c 72%) !important;
+  }
+
+  /* vignette + grid texture over the map for a control-room feel */
+  .vignette{
+    position:absolute; inset:0; z-index:2; pointer-events:none;
+    background:
+      radial-gradient(ellipse at 50% 45%, rgba(5,7,12,0) 40%, rgba(5,7,12,0.5) 100%),
+      linear-gradient(180deg, rgba(5,7,12,0.85) 0%, rgba(5,7,12,0) 14%, rgba(5,7,12,0) 82%, rgba(5,7,12,0.9) 100%);
+  }
+  .scanlines{
+    position:absolute; inset:0; z-index:3; pointer-events:none; opacity:0.04;
+    background: repeating-linear-gradient(0deg, #fff 0px, #fff 1px, transparent 1px, transparent 3px);
+    mix-blend-mode: overlay;
+  }
+
+  /* ---------- Top bar ---------- */
+  .topbar{
+    position:absolute; top:0; left:0; right:0; z-index:10;
+    display:flex; align-items:center; justify-content:space-between;
+    padding:20px 28px; pointer-events:none;
+  }
+  .brand{ display:flex; flex-direction:column; gap:2px; pointer-events:auto; }
+  .brand .mark{ display:flex; align-items:center; gap:10px; font-size:19px; font-weight:700; letter-spacing:0.5px; color:var(--text); }
+  .brand .mark svg{ width:22px; height:22px; color:var(--amber); }
+  .brand .sub{ font-family:var(--mono); font-size:11px; color:var(--text-dim); letter-spacing:1.2px; padding-left:32px; }
+
+  .clockwrap{
+    pointer-events:auto; display:flex; gap:22px;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:10px 22px; backdrop-filter: blur(10px);
+  }
+  .clockcell{ text-align:center; min-width:88px; }
+  .clockcell .time{ font-family:var(--mono); font-size:20px; font-weight:600; color:var(--text); letter-spacing:1px;}
+  .clockcell .zone{ font-family:var(--mono); font-size:9.5px; color:var(--text-dim); letter-spacing:1.5px; margin-top:2px;}
+  .clockdiv{ width:1px; background:var(--line-strong); }
+
+  .live-badge{
+    pointer-events:auto; display:flex; align-items:center; gap:10px;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:9px 16px; backdrop-filter: blur(10px);
+  }
+  .dot{ width:9px; height:9px; border-radius:50%; background:var(--red); box-shadow:0 0 8px var(--red); animation: pulse 1.6s infinite ease-in-out; }
+  @keyframes pulse{ 0%,100%{ opacity:1; transform:scale(1); } 50%{ opacity:0.35; transform:scale(0.8); } }
+  .live-text{ font-family:var(--mono); font-size:12px; font-weight:700; letter-spacing:2px; color:var(--text); }
+  .live-sub{ font-family:var(--mono); font-size:10px; color:var(--text-dim); letter-spacing:0.5px; }
+
+  /* ---------- Side panels ---------- */
+  .panel{
+    position:absolute; z-index:10; background:var(--panel); border:1px solid var(--line);
+    border-radius:12px; backdrop-filter: blur(10px); padding:16px 18px;
+  }
+  .panel h3{ margin:0 0 12px 0; font-size:11px; letter-spacing:1.6px; font-weight:600; color:var(--text-dim); display:flex; align-items:center; gap:8px; }
+  .panel h3::before{ content:''; width:4px; height:4px; border-radius:50%; background:var(--amber); }
+
+  .stats{ top:110px; left:28px; width:216px; }
+  .statrow{ display:flex; justify-content:space-between; align-items:baseline; padding:9px 0; border-bottom:1px solid var(--line); }
+  .statrow:last-child{ border-bottom:none; }
+  .statlabel{ font-size:12px; color:var(--text-mid); }
+  .statvalue{ font-family:var(--mono); font-size:16px; font-weight:600; color:var(--text); }
+  .statvalue.amber{ color:var(--amber); }
+  .statvalue.cyan{ color:var(--cyan); }
+
+  .flights{ top:110px; right:28px; width:280px; max-height:56vh; display:flex; flex-direction:column; }
+  .flightlist{ overflow-y:auto; padding-right:4px; }
+  .flightlist::-webkit-scrollbar{ width:5px; }
+  .flightlist::-webkit-scrollbar-thumb{ background:var(--line-strong); border-radius:4px; }
+  .frow{ display:flex; align-items:center; justify-content:space-between; padding:9px 4px; border-bottom:1px solid var(--line); }
+  .frow:last-child{ border-bottom:none; }
+  .fcall{ display:flex; flex-direction:column; gap:2px; }
+  .fcallsign{ font-family:var(--mono); font-size:13px; font-weight:700; color:var(--text); }
+  .fcountry{ font-size:10.5px; color:var(--text-dim); }
+  .fmeta{ text-align:right; display:flex; flex-direction:column; gap:2px; }
+  .falt{ font-family:var(--mono); font-size:12px; color:var(--amber); }
+  .fspeed{ font-family:var(--mono); font-size:10px; color:var(--text-dim); }
+
+  /* ---------- Legend ---------- */
+  .legend{ bottom:78px; left:28px; display:flex; gap:16px; padding:10px 18px; flex-wrap:wrap; }
+  .legenditem{ display:flex; align-items:center; gap:7px; font-size:11px; color:var(--text-mid); white-space:nowrap; }
+  .legendswatch{ width:9px; height:9px; border-radius:50%; }
+  .legendswatch.night{ background:#0a1424; border:1px solid var(--line-strong); }
+
+  /* ---------- Ticker ---------- */
+  .ticker{
+    position:absolute; bottom:0; left:0; right:0; z-index:10; height:46px;
+    background:linear-gradient(180deg, rgba(11,18,32,0.4), rgba(11,18,32,0.92));
+    border-top:1px solid var(--line); display:flex; align-items:center; overflow:hidden; backdrop-filter: blur(6px);
+  }
+  .ticker-label{
+    flex:0 0 auto; background:var(--amber); color:#1a0f00;
+    font-family:var(--mono); font-weight:700; font-size:11px; letter-spacing:1.5px;
+    padding:8px 16px; height:100%; display:flex; align-items:center; z-index:2;
+  }
+  .ticker-track-wrap{ overflow:hidden; flex:1; position:relative; height:100%; }
+  .ticker-track{ position:absolute; white-space:nowrap; display:flex; align-items:center; height:100%; animation: scroll-left 90s linear infinite; will-change: transform; }
+  .ticker-track span{ font-family:var(--mono); font-size:12.5px; color:var(--text-mid); padding:0 26px; display:inline-flex; align-items:center; gap:8px; }
+  .ticker-track span b{ color:var(--text); }
+  .ticker-track span::before{ content:'✈'; color:var(--cyan); font-size:11px; }
+  @keyframes scroll-left{ from{ transform:translateX(0); } to{ transform:translateX(-50%); } }
+
+  /* ---------- Plane marker (detailed top-down jet silhouette) ---------- */
+  .plane-marker{ position:relative; width:26px; height:26px; }
+  .plane-glow{
+    position:absolute; top:50%; left:50%; width:18px; height:18px;
+    transform:translate(-50%,-50%); border-radius:50%;
+    background:currentColor; opacity:0.25; filter:blur(3px); pointer-events:none;
+  }
+  .plane-rot{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    transition: transform 0.45s linear;
+  }
+  .plane-rot svg{ display:block; overflow:visible; }
+
+  .leaflet-marker-icon{ transition: transform 0.85s linear; }
+
+  .leaflet-popup-content-wrapper{ background:var(--panel-solid); color:var(--text); border:1px solid var(--line-strong); border-radius:10px; }
+  .leaflet-popup-tip{ background:var(--panel-solid); }
+  .leaflet-popup-content{ font-family:var(--mono); font-size:12px; margin:12px 14px; line-height:1.6; }
+  .leaflet-popup-content b{ color:var(--amber); }
+  .leaflet-control-attribution{ background:rgba(5,7,12,0.6) !important; color:var(--text-dim) !important; font-family:var(--mono); font-size:9px !important; }
+  .leaflet-control-attribution a{ color:var(--text-mid) !important; }
+  .leaflet-control-zoom{ display:none; }
+
+  .loading-toast{
+    position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+    z-index:20; font-family:var(--mono); font-size:12px; color:var(--text-dim);
+    letter-spacing:1px; opacity:0; transition:opacity 0.4s ease; pointer-events:none;
+  }
+  .loading-toast.show{ opacity:1; }
+
+  @media (max-width: 900px){
+    .flights{ display:none; }
+    .stats{ width:180px; }
+    .clockwrap{ gap:14px; padding:8px 14px; }
+    .clockcell{ min-width:64px; }
+    .clockcell .time{ font-size:16px; }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<div class="vignette"></div>
+<div class="scanlines"></div>
+
+<div class="topbar">
+  <div class="brand">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M22 16.5v-2l-8.5-5V4a1.5 1.5 0 0 0-3 0v5.5L2 14.5v2l8.5-2.6V19l-2.5 1.8V22l3.5-1 3.5 1v-1.2L12.5 19v-5.1L22 16.5z"/></svg>
+      GLOBAL FLIGHT TRACKER
+    </div>
+    <div class="sub">LIVE WORLDWIDE ADS-B COVERAGE</div>
+  </div>
+
+  <div class="clockwrap">
+    <div class="clockcell">
+      <div class="time" id="clock-utc">--:--:--</div>
+      <div class="zone">UTC</div>
+    </div>
+    <div class="clockdiv"></div>
+    <div class="clockcell">
+      <div class="time" id="clock-local">--:--:--</div>
+      <div class="zone" id="clock-local-zone">LOCAL</div>
+    </div>
+  </div>
+
+  <div class="live-badge">
+    <div class="dot"></div>
+    <div>
+      <div class="live-text">LIVE</div>
+      <div class="live-sub" id="session-timer">00:00:00</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel stats">
+  <h3>GLOBAL STATUS</h3>
+  <div class="statrow"><span class="statlabel">Aircraft tracked</span><span class="statvalue amber" id="stat-count">—</span></div>
+  <div class="statrow"><span class="statlabel">Avg. altitude</span><span class="statvalue" id="stat-alt">—</span></div>
+  <div class="statrow"><span class="statlabel">Avg. speed</span><span class="statvalue" id="stat-speed">—</span></div>
+  <div class="statrow"><span class="statlabel">Countries</span><span class="statvalue cyan" id="stat-countries">—</span></div>
+  <div class="statrow"><span class="statlabel">Highest flight</span><span class="statvalue" id="stat-highest">—</span></div>
+  <div class="statrow"><span class="statlabel">Data refresh</span><span class="statvalue" id="stat-refresh">—</span></div>
+</div>
+
+<div class="panel flights">
+  <h3>NOTABLE FLIGHTS</h3>
+  <div class="flightlist" id="flight-list"></div>
+</div>
+
+<div class="panel legend">
+  <div class="legenditem"><span class="legendswatch" style="background:var(--cyan)"></span>Climb / Low</div>
+  <div class="legenditem"><span class="legendswatch" style="background:var(--amber)"></span>Cruise</div>
+  <div class="legenditem"><span class="legendswatch" style="background:var(--ground)"></span>Ground</div>
+  <div class="legenditem"><span class="legendswatch night"></span>Night side</div>
+</div>
+
+<div class="loading-toast" id="loading-toast">ACQUIRING SIGNAL…</div>
+
+<div class="ticker">
+  <div class="ticker-label">ON RADAR</div>
+  <div class="ticker-track-wrap">
+    <div class="ticker-track" id="ticker-track"></div>
+  </div>
+</div>
+
+<script>
+/* =========================================================
+   GLOBAL FLIGHT TRACKER — LIVE
+   Earth:   real country polygons (datasets/geo-countries, Natural Earth
+            data), rendered client-side — no raster tile server dependency.
+   Sun:     a live day/night terminator, recomputed every minute from
+            standard solar-position astronomy (no external service).
+   Traffic: OpenSky Network live states -> ./data/flights.json fallback
+            -> simulated traffic model, always rendered smoothly via
+            dead-reckoning between refreshes so aircraft glide instead
+            of jumping.
+   ========================================================= */
+
+const FETCH_MS = 15000;
+const MOVE_TICK_MS = 900;
+// Real-world velocity is ~1 px/many-seconds at this whole-earth zoom level,
+// so it reads as static. This scales only the on-screen glide rate;
+// reported speed/altitude/heading in the stats panel and popups stay real.
+const MOVE_VISUAL_SCALE = 18;
+// Rendering every tracked aircraft as its own DOM marker (~12k+ globally)
+// is what was starving the encoder of CPU. Capping keeps the "busy sky"
+// look without the per-tick repaint cost of thousands of nodes.
+const MAX_RENDERED_FLIGHTS = 900;
+const OPEN_SKY_URL = 'https://opensky-network.org/api/states/all';
+const CORS_RELAY = 'https://corsproxy.io/?url=';
+const LOCAL_DATA_URL = './data/flights.json';
+const COUNTRIES_URL = 'https://raw.githubusercontent.com/datasets/geo-countries/main/data/countries.geojson';
+
+const map = L.map('map', {
+  zoomControl:false, attributionControl:true, worldCopyJump:true,
+  minZoom:2, maxZoom:9, fadeAnimation:false,
+}).setView([25, 15], 3);
+
+map.createPane('countries'); map.getPane('countries').style.zIndex = 350;
+map.createPane('terminator'); map.getPane('terminator').style.zIndex = 380;
+map.getPane('terminator').style.pointerEvents = 'none';
+
+/* ---------- Real earth: actual country polygons ---------- */
+function applyRasterFallback(){
+  L.tileLayer('https://services.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    pane:'countries', maxZoom:16,
+    attribution:'Esri, HERE, Garmin — Data: OpenSky Network',
+  }).addTo(map);
+}
+
+fetch(COUNTRIES_URL)
+  .then(res=>{ if(!res.ok) throw new Error('geojson http '+res.status); return res.json(); })
+  .then(geo=>{
+    L.geoJSON(geo, {
+      pane:'countries',
+      renderer:L.canvas({ padding:0.4 }),
+      style:{ color:'#3c5077', weight:0.6, fillColor:'#1b2c48', fillOpacity:1 },
+    }).addTo(map);
+  })
+  .catch(err=>{
+    console.warn('Country GeoJSON unavailable, using raster fallback:', err.message);
+    applyRasterFallback();
   });
 
-  const [page] = await browser.pages();
-  await page.setViewport({ width: WIDTH, height: HEIGHT });
+/* ---------- Day / night terminator (live solar position) ---------- */
+const DEG = Math.PI/180;
+function sunPosition(date){
+  const dayMs = 86400000, J1970 = 2440588, J2000 = 2451545;
+  const d = date.valueOf()/dayMs - 0.5 + J1970 - J2000;
+  const M = DEG*(357.5291 + 0.98560028*d);
+  const C = DEG*(1.9148*Math.sin(M) + 0.02*Math.sin(2*M) + 0.0003*Math.sin(3*M));
+  const P = DEG*102.9372;
+  const L = M + C + P + Math.PI;
+  const e = DEG*23.4397;
+  const dec = Math.asin(Math.sin(e)*Math.sin(L));
+  const ra = Math.atan2(Math.sin(L)*Math.cos(e), Math.cos(L));
+  const gmst = DEG*(280.16 + 360.9856235*d);
+  let lon = ((ra-gmst)*180/Math.PI) % 360;
+  if(lon>180) lon-=360; if(lon<-180) lon+=360;
+  return { lat: dec*180/Math.PI, lon, dec };
+}
+function terminatorRing(date){
+  const sun = sunPosition(date);
+  const tanDec = Math.tan(sun.dec) || 1e-6;
+  const pts = [];
+  for(let i=-180;i<=180;i+=3){
+    const H = i*DEG;
+    const phi = Math.atan(-Math.cos(H)/tanDec) * 180/Math.PI;
+    pts.push([phi, sun.lon+i]);
+  }
+  const darkPole = sun.dec>=0 ? -90 : 90;
+  return { ring:[[darkPole, sun.lon-180], ...pts, [darkPole, sun.lon+180]], sun };
+}
+let terminatorLayer = null;
+function renderTerminator(){
+  const { ring } = terminatorRing(new Date());
+  const shift = (r,off)=> r.map(([la,lo])=>[la,lo+off]);
+  const multi = [ [ring], [shift(ring,-360)], [shift(ring,360)] ];
+  if(terminatorLayer) map.removeLayer(terminatorLayer);
+  terminatorLayer = L.polygon(multi, {
+    pane:'terminator', stroke:true, color:'#ffcf8f', weight:1.3, opacity:0.35,
+    fill:true, fillColor:'#00030a', fillOpacity:0.72, interactive:false,
+  }).addTo(map);
+}
+renderTerminator();
+setInterval(renderTerminator, 60000);
 
-  const goto = async () => {
-    try {
-      await page.goto(URL, { waitUntil: 'networkidle2', timeout: 30000 });
-      console.log('Dashboard loaded:', URL);
-      await page.screenshot({ path: 'launch-check.png' });
-      console.log('Saved launch-check.png for debugging');
-    } catch (err) {
-      console.error('Failed to load dashboard, retrying in 5s:', err.message);
-      setTimeout(goto, 5000);
+/* ---------- Clocks ---------- */
+function pad(n){ return n.toString().padStart(2,'0'); }
+let sessionStart = Date.now();
+function tickClocks(){
+  const now = new Date();
+  document.getElementById('clock-utc').textContent =
+    `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}`;
+  document.getElementById('clock-local').textContent =
+    `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  try{
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone.split('/').pop().replace('_',' ');
+    document.getElementById('clock-local-zone').textContent = tz.toUpperCase();
+  }catch(e){}
+  const elapsed = Math.floor((Date.now()-sessionStart)/1000);
+  document.getElementById('session-timer').textContent =
+    `${pad(Math.floor(elapsed/3600))}:${pad(Math.floor((elapsed%3600)/60))}:${pad(elapsed%60)} ON AIR`;
+}
+setInterval(tickClocks, 1000); tickClocks();
+
+/* ---------- Geometry helpers (flat-earth approximation, fine at world zoom) ---------- */
+function advance(lat, lon, headingDeg, meters){
+  const R = 6371000;
+  const brng = headingDeg*DEG;
+  const dLat = (meters*Math.cos(brng))/R * (180/Math.PI);
+  const dLon = (meters*Math.sin(brng))/(R*Math.cos(lat*DEG)) * (180/Math.PI);
+  return [lat+dLat, lon+dLon];
+}
+function bearingTo(lat1,lon1,lat2,lon2){
+  const y = Math.sin((lon2-lon1)*DEG)*Math.cos(lat2*DEG);
+  const x = Math.cos(lat1*DEG)*Math.sin(lat2*DEG) - Math.sin(lat1*DEG)*Math.cos(lat2*DEG)*Math.cos((lon2-lon1)*DEG);
+  return (Math.atan2(y,x)*180/Math.PI + 360) % 360;
+}
+function distanceMeters(lat1,lon1,lat2,lon2){
+  const R = 6371000;
+  const dLat=(lat2-lat1)*DEG, dLon=(lon2-lon1)*DEG;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*DEG)*Math.cos(lat2*DEG)*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+
+/* ---------- Realistic top-down jet icon ---------- */
+const PLANE_SVG = `
+<svg width="19" height="19" viewBox="0 0 24 24" overflow="visible">
+  <g>
+    <polygon points="13.1,9.5 22,14 21.3,15.8 13,13" fill="currentColor"/>
+    <polygon points="10.9,9.5 2,14 2.7,15.8 11,13" fill="currentColor"/>
+    <polygon points="12.6,17.4 17.3,19.7 16.6,21 12.5,19.2" fill="currentColor"/>
+    <polygon points="11.4,17.4 6.7,19.7 7.4,21 11.5,19.2" fill="currentColor"/>
+    <polygon points="12,1 13.1,4.2 13.3,9.3 12.8,20.5 12,23 11.2,20.5 10.7,9.3 10.9,4.2" fill="currentColor"/>
+    <ellipse cx="16.6" cy="12.3" rx="1.9" ry="1.05" transform="rotate(27 16.6 12.3)" fill="#000" opacity="0.4"/>
+    <ellipse cx="7.4" cy="12.3" rx="1.9" ry="1.05" transform="rotate(-27 7.4 12.3)" fill="#000" opacity="0.4"/>
+    <ellipse cx="12" cy="4.6" rx="0.65" ry="0.95" fill="#000" opacity="0.28"/>
+  </g>
+</svg>`;
+
+function colorVar(name){ return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function colorFor(f){
+  if(f.on_ground) return colorVar('--ground');
+  if(f.altitude!=null && f.altitude < 3000) return colorVar('--cyan');
+  return colorVar('--amber');
+}
+function makeIcon(color){
+  return L.divIcon({
+    className:'plane-marker-wrap',
+    html:`<div class="plane-marker" style="color:${color}">
+            <div class="plane-glow"></div>
+            <div class="plane-rot">${PLANE_SVG}</div>
+          </div>`,
+    iconSize:[26,26], iconAnchor:[13,13],
+  });
+}
+
+const live = new Map(); // icao24 -> { lat, lon, heading, velocity(m/s), altitude, callsign, country, on_ground, marker, color }
+
+function upsertFlight(f){
+  if(f.lat==null || f.lon==null) return;
+  const color = colorFor(f);
+  let entry = live.get(f.icao24);
+
+  if(!entry){
+    const marker = L.marker([f.lat, f.lon], {icon: makeIcon(color)}).addTo(map);
+    entry = { marker };
+    live.set(f.icao24, entry);
+  }
+
+  Object.assign(entry, {
+    lat:f.lat, lon:f.lon, heading:f.heading||0, velocity:f.velocity||0,
+    altitude:f.altitude, callsign:f.callsign, country:f.country,
+    on_ground:f.on_ground, color, simRoute:f.simRoute||entry.simRoute,
+  });
+
+  entry.marker.setLatLng([f.lat, f.lon]);
+  const el = entry.marker.getElement();
+  if(el){
+    const marker = el.querySelector('.plane-marker');
+    const rot = el.querySelector('.plane-rot');
+    if(marker) marker.style.color = color;
+    if(rot) rot.style.transform = `rotate(${(f.heading||0)}deg)`;
+  }
+  entry.marker.setPopupContent(popupHtml(entry));
+}
+
+function popupHtml(f){
+  return `<b>${(f.callsign||'UNKNOWN').trim()||'UNKNOWN'}</b><br/>
+    Origin: ${f.country||'—'}<br/>
+    Altitude: ${f.altitude!=null? Math.round(f.altitude)+' m':'—'}<br/>
+    Speed: ${f.velocity!=null? Math.round(f.velocity*3.6)+' km/h':'—'}<br/>
+    Heading: ${f.heading!=null? Math.round(f.heading)+'°':'—'}`;
+}
+
+function removeStale(keepIds){
+  for(const [id, entry] of live){
+    if(id.startsWith('sim')) continue; // simulated fleet persists & respawns
+    if(!keepIds.has(id)){
+      map.removeLayer(entry.marker);
+      live.delete(id);
     }
-  };
-  await goto();
+  }
+}
 
-  // If the tab ever crashes, reopen it rather than leaving a black screen.
-  page.on('close', async () => {
-    console.warn('Page closed, relaunching...');
-    const [p2] = await browser.pages();
-    if (p2) await p2.goto(URL).catch(() => {});
-  });
+/* ---------- Dead-reckoning tick: gives continuous, lifelike motion ---------- */
+setInterval(()=>{
+  const dt = MOVE_TICK_MS/1000;
+  for(const [id, f] of live){
+    if(f.on_ground || !f.velocity) continue;
 
-  // Keep the process alive; the workflow step controls the overall duration.
-  await new Promise(() => {});
-})();
+    if(id.startsWith('sim') && f.simRoute){
+      const r = f.simRoute;
+      r.traveled += f.velocity*dt;
+      if(r.traveled >= r.total){
+        respawnSim(id, f);
+        continue;
+      }
+    }
+
+    const [nlat, nlon] = advance(f.lat, f.lon, f.heading, f.velocity*dt*MOVE_VISUAL_SCALE);
+    f.lat = nlat; f.lon = nlon;
+    f.marker.setLatLng([nlat, nlon]);
+  }
+}, MOVE_TICK_MS);
+
+/* ---------- Stats / list / ticker ---------- */
+function updateStats(){
+  const all = [...live.values()];
+  const airborne = all.filter(f=>!f.on_ground && f.altitude!=null);
+  const count = lastRawCount || all.length;
+  const avgAlt = airborne.length ? Math.round(airborne.reduce((a,f)=>a+f.altitude,0)/airborne.length) : 0;
+  const avgSpeed = airborne.length ? Math.round(airborne.reduce((a,f)=>a+(f.velocity||0),0)/airborne.length*3.6) : 0;
+  const countries = new Set(all.map(f=>f.country).filter(Boolean)).size;
+  const highest = airborne.reduce((max,f)=> f.altitude>(max?.altitude||0)? f : max, null);
+
+  document.getElementById('stat-count').textContent = count.toLocaleString();
+  document.getElementById('stat-alt').textContent = avgAlt.toLocaleString()+' m';
+  document.getElementById('stat-speed').textContent = avgSpeed.toLocaleString()+' km/h';
+  document.getElementById('stat-countries').textContent = countries;
+  document.getElementById('stat-highest').textContent = highest ? `${(highest.callsign||'—').trim()} · ${Math.round(highest.altitude).toLocaleString()}m` : '—';
+  document.getElementById('stat-refresh').textContent = lastSource;
+}
+
+function updateFlightList(){
+  const notable = [...live.values()]
+    .filter(f=>!f.on_ground)
+    .sort((a,b)=>(b.altitude||0)-(a.altitude||0))
+    .slice(0,18);
+
+  document.getElementById('flight-list').innerHTML = notable.map(f=>`
+    <div class="frow">
+      <div class="fcall">
+        <div class="fcallsign">${(f.callsign||'—').trim()||'—'}</div>
+        <div class="fcountry">${f.country||'Unknown'}</div>
+      </div>
+      <div class="fmeta">
+        <div class="falt">${f.altitude!=null? Math.round(f.altitude).toLocaleString()+'m':'—'}</div>
+        <div class="fspeed">${f.velocity!=null? Math.round(f.velocity*3.6)+' km/h':'—'}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function updateTicker(){
+  const sample = [...live.values()].filter(f=>f.callsign && f.callsign.trim()).sort(()=>Math.random()-0.5).slice(0,24);
+  const items = sample.map(f=>`<span><b>${f.callsign.trim()}</b>${f.country||''} · ${f.altitude?Math.round(f.altitude)+'m':'—'}</span>`).join('');
+  document.getElementById('ticker-track').innerHTML = items + items;
+}
+
+/* ---------- Data sources ---------- */
+let lastSource = 'INITIALIZING';
+let lastRawCount = 0;
+
+async function fetchLocalSnapshot(){
+  const res = await fetch(LOCAL_DATA_URL, {cache:'no-store'});
+  if(!res.ok) throw new Error('no local snapshot');
+  const json = await res.json();
+  if(!json.flights || !json.flights.length) throw new Error('empty snapshot');
+  lastSource = 'GITHUB ACTION · ' + new Date().toLocaleTimeString();
+  return json.flights;
+}
+
+async function fetchOpenSky(){
+  const res = await fetch(CORS_RELAY + encodeURIComponent(OPEN_SKY_URL));
+  if(!res.ok) throw new Error('opensky unreachable');
+  const json = await res.json();
+  const flights = (json.states||[]).map(s=>({
+    icao24: s[0], callsign: (s[1]||'').trim(), country: s[2],
+    lon: s[5], lat: s[6], altitude: s[7]||s[13], on_ground: s[8],
+    velocity: s[9], heading: s[10],
+  })).filter(f=>f.lat!=null && f.lon!=null);
+  if(!flights.length) throw new Error('empty response');
+  lastSource = 'OPENSKY LIVE · ' + new Date().toLocaleTimeString();
+  return flights;
+}
+
+/* ---------- Simulated fallback (keeps the board alive & lifelike offline) ---------- */
+const HUBS = [
+  {name:'LHR',lat:51.47,lon:-0.45},{name:'JFK',lat:40.64,lon:-73.78},{name:'DXB',lat:25.25,lon:55.36},
+  {name:'HND',lat:35.55,lon:139.78},{name:'SIN',lat:1.36,lon:103.99},{name:'FRA',lat:50.03,lon:8.57},
+  {name:'SYD',lat:-33.95,lon:151.18},{name:'GRU',lat:-23.43,lon:-46.47},{name:'JNB',lat:-26.13,lon:28.24},
+  {name:'LAX',lat:33.94,lon:-118.41},{name:'ORD',lat:41.98,lon:-87.90},{name:'PEK',lat:40.08,lon:116.58},
+  {name:'CDG',lat:49.01,lon:2.55},{name:'DEL',lat:28.56,lon:77.10},{name:'AMS',lat:52.31,lon:4.76},
+  {name:'YYZ',lat:43.68,lon:-79.63},{name:'ICN',lat:37.46,lon:126.44},{name:'MEX',lat:19.44,lon:-99.07},
+];
+const COUNTRIES = ['United States','United Kingdom','Germany','Singapore','United Arab Emirates','Japan','France','Australia','Brazil','Qatar','Canada','South Korea','India','Netherlands','South Africa'];
+const AIRLINES = ['BAW','UAL','DLH','SIA','QFA','UAE','AAL','AFR','JAL','ANA','KLM','CPA','QTR','ETD','ACA','KAL'];
+
+function newSimRoute(){
+  let a = HUBS[Math.floor(Math.random()*HUBS.length)];
+  let b = HUBS[Math.floor(Math.random()*HUBS.length)];
+  while(b===a) b = HUBS[Math.floor(Math.random()*HUBS.length)];
+  const total = distanceMeters(a.lat,a.lon,b.lat,b.lon);
+  const heading = bearingTo(a.lat,a.lon,b.lat,b.lon);
+  return { a, b, total, traveled:0, heading };
+}
+
+function respawnSim(id, f){
+  const route = newSimRoute();
+  f.lat = route.a.lat; f.lon = route.a.lon;
+  f.heading = route.heading;
+  f.velocity = 220 + Math.random()*60;
+  f.altitude = 9000 + Math.random()*3500;
+  f.simRoute = route;
+  f.callsign = AIRLINES[Math.floor(Math.random()*AIRLINES.length)] + (100+Math.floor(Math.random()*900));
+  f.country = COUNTRIES[Math.floor(Math.random()*COUNTRIES.length)];
+}
+
+function ensureSimFleet(n=160){
+  for(let i=0; i<n; i++){
+    const id = 'sim'+i;
+    if(live.has(id)) continue;
+    const route = newSimRoute();
+    const t = Math.random(); // scatter initial progress along the route
+    route.traveled = route.total * t;
+    const [lat, lon] = advance(route.a.lat, route.a.lon, route.heading, route.traveled);
+    const f = {
+      icao24:id,
+      callsign: AIRLINES[Math.floor(Math.random()*AIRLINES.length)] + (100+Math.floor(Math.random()*900)),
+      country: COUNTRIES[Math.floor(Math.random()*COUNTRIES.length)],
+      lat, lon, heading: route.heading, velocity: 220+Math.random()*60,
+      altitude: 9000+Math.random()*3500, on_ground:false, simRoute: route,
+    };
+    upsertFlight(f);
+  }
+  lastSource = 'SIMULATED MODEL · ' + new Date().toLocaleTimeString();
+}
+
+/* ---------- Master refresh loop (corrects course/speed; movement itself is continuous) ---------- */
+function showToast(msg){
+  const t = document.getElementById('loading-toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 1800);
+}
+
+async function refresh(){
+  let flights = null;
+  try{ flights = await fetchLocalSnapshot(); }
+  catch(e){
+    try{ flights = await fetchOpenSky(); }
+    catch(e2){ flights = null; }
+  }
+
+  if(flights && flights.length){
+    lastRawCount = flights.length;
+    const rendered = flights.length > MAX_RENDERED_FLIGHTS ? flights.slice(0, MAX_RENDERED_FLIGHTS) : flights;
+    const ids = new Set(rendered.map(f=>f.icao24));
+    rendered.forEach(upsertFlight);
+    removeStale(ids);
+  } else {
+    ensureSimFleet();
+    lastRawCount = live.size;
+  }
+
+  updateStats();
+  updateFlightList();
+  updateTicker();
+}
+
+showToast('ACQUIRING SIGNAL…');
+refresh();
+setInterval(refresh, FETCH_MS);
+setInterval(updateStats, 2000);
+setInterval(updateFlightList, 4000);
+</script>
+</body>
+</html>
