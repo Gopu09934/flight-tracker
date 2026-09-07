@@ -23,6 +23,9 @@ const HEIGHT = 1080;
       '--autoplay-policy=no-user-gesture-required',
       '--disable-dev-shm-usage',
       '--disable-gpu-shader-disk-cache',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--use-gl=swiftshader',
       '--no-sandbox',
       '--disable-setuid-sandbox',
     ],
@@ -36,6 +39,8 @@ const HEIGHT = 1080;
     try {
       await page.goto(URL, { waitUntil: 'networkidle2', timeout: 30000 });
       console.log('Dashboard loaded:', URL);
+      await page.screenshot({ path: 'launch-check.png' });
+      console.log('Saved launch-check.png for debugging');
     } catch (err) {
       console.error('Failed to load dashboard, retrying in 5s:', err.message);
       setTimeout(goto, 5000);
