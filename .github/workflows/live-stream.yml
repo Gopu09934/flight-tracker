@@ -1,24 +1,44 @@
 name: 24/7 YouTube live stream
 
 # GitHub-hosted runners are capped at ~6 hours per job, so true 24/7 uptime
-# is achieved by chaining sessions: each run streams for ~5h50m, and a new
+# is achieved by chaining sessions: each run streams for ~5h40m, and a new
 # run is scheduled to pick up right after (there will be a short reconnect
 # gap of roughly a minute between sessions while the next job boots).
+#
+# Resilience added in this version:
+#   - apt-get / npm installs retry a few times before giving up (flaky mirrors)
+#   - ffmpeg runs inside a watchdog loop: if it dies early (network blip,
+#     YouTube hiccup, etc.) it's relaunched immediately for the remaining
+#     time instead of ending the job
+#   - a final "self-heal" step fires on ANY failure or cancellation of this
+#     job (bad install, ffmpeg giving up, runner flaking, timeout, etc.) and
+#     immediately dispatches a brand-new run via the GitHub API, so you don't
+#     have to wait for the next 6-hour cron tick to come back online
 #
 # Required repo secret:
 #   YOUTUBE_STREAM_KEY   -> from YouTube Studio > Go Live > Stream key
 #
 # Optional secrets (raise the OpenSky rate limit):
 #   OPENSKY_CLIENT_ID / OPENSKY_CLIENT_SECRET
+#
+# NOTE: set WORKFLOW_FILE below to this file's actual name under
+# .github/workflows/ so the self-heal step knows what to re-dispatch.
 
 on:
   schedule:
-    - cron: '0 */6 * * *'     # kicks off a new ~5h50m session every 6 hours
+    - cron: '0 */6 * * *'     # kicks off a new ~5h40m session every 6 hours
   workflow_dispatch: {}
 
 concurrency:
   group: live-stream
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # required so the self-heal step can dispatch a new run
+
+env:
+  WORKFLOW_FILE: stream.yml   # <-- change to this file's real filename
 
 jobs:
   stream:
@@ -31,16 +51,29 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install system dependencies
+      - name: Install system dependencies (with retry)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
-            libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 || \
-          sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
-            libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2
+          set -e
+          for i in 1 2 3; do
+            sudo apt-get update && \
+            { sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
+                libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64 || \
+              sudo apt-get install -y ffmpeg xvfb x11-utils fonts-liberation \
+                libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2; } && break
+            echo "apt-get attempt $i failed, retrying in 10s..."
+            sleep 10
+            if [ "$i" = "3" ]; then echo "::error::apt-get failed after 3 attempts"; exit 1; fi
+          done
 
-      - name: Install Node dependencies
-        run: npm install puppeteer@22 http-server@14
+      - name: Install Node dependencies (with retry)
+        run: |
+          set -e
+          for i in 1 2 3; do
+            npm install puppeteer@22 http-server@14 && break
+            echo "npm install attempt $i failed, retrying in 10s..."
+            sleep 10
+            if [ "$i" = "3" ]; then echo "::error::npm install failed after 3 attempts"; exit 1; fi
+          done
 
       - name: Prime initial flight snapshot
         env:
@@ -72,7 +105,7 @@ jobs:
           nohup node scripts/launch-browser.js > browser.log 2>&1 &
           sleep 8
 
-      - name: Stream to YouTube via ffmpeg
+      - name: Stream to YouTube via ffmpeg (with watchdog auto-restart)
         env:
           YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
         run: |
@@ -80,13 +113,59 @@ jobs:
             echo "::error::YOUTUBE_STREAM_KEY secret is not set. Add it in Settings > Secrets > Actions."
             exit 1
           fi
-          # Session length in seconds, kept under the job's timeout-minutes budget.
-          DURATION=$((5*3600 + 40*60))
-          ffmpeg -nostdin \
-            -f x11grab -draw_mouse 0 -video_size 1920x1080 -framerate 24 -i :99.0 \
-            -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
-            -c:v libx264 -preset ultrafast -tune zerolatency \
-            -b:v 4000k -maxrate 4000k -bufsize 8000k -pix_fmt yuv420p -g 48 \
-            -c:a aac -b:a 128k -ar 44100 \
-            -t "${DURATION}" \
-            -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+
+          # Total session length in seconds, kept under the job's timeout-minutes budget.
+          TOTAL_DURATION=$((5*3600 + 40*60))
+          END_TIME=$(( $(date +%s) + TOTAL_DURATION ))
+
+          MAX_RESTARTS=50
+          restart_count=0
+
+          while [ "$(date +%s)" -lt "$END_TIME" ]; do
+            REMAINING=$(( END_TIME - $(date +%s) ))
+            if [ "$REMAINING" -le 5 ]; then
+              break
+            fi
+
+            echo "Starting ffmpeg for up to ${REMAINING}s (restart #${restart_count})..."
+
+            set +e
+            ffmpeg -nostdin \
+              -f x11grab -draw_mouse 0 -video_size 1920x1080 -framerate 24 -i :99.0 \
+              -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 \
+              -c:v libx264 -preset ultrafast -tune zerolatency \
+              -b:v 4000k -maxrate 4000k -bufsize 8000k -pix_fmt yuv420p -g 48 \
+              -c:a aac -b:a 128k -ar 44100 \
+              -t "${REMAINING}" \
+              -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+            EXIT_CODE=$?
+            set -e
+
+            NOW=$(date +%s)
+            if [ "$NOW" -ge "$END_TIME" ]; then
+              echo "ffmpeg exited (code ${EXIT_CODE}) and session time is up. Ending normally."
+              break
+            fi
+
+            restart_count=$((restart_count + 1))
+            if [ "$restart_count" -gt "$MAX_RESTARTS" ]; then
+              echo "::error::ffmpeg failed ${MAX_RESTARTS} times, giving up on this session."
+              exit 1
+            fi
+
+            echo "ffmpeg exited early (code ${EXIT_CODE}) with $(( END_TIME - NOW ))s left. Restarting in 5s..."
+            sleep 5
+          done
+
+      - name: Self-heal - relaunch on failure or cancellation
+        if: always() && (failure() || cancelled())
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "This run ended abnormally (failure or cancellation). Dispatching a fresh run..."
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            -f ref="${{ github.ref_name }}" \
+          || echo "::warning::Self-heal dispatch failed - the next scheduled cron run will still pick things back up."
