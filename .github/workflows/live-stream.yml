@@ -26,7 +26,7 @@ name: 24/7 YouTube live stream
 
 on:
   schedule:
-    - cron: '0 */6 * * *'     # kicks off a new ~5h40m session every 6 hours
+    - cron: '0 */5 * * *'     # kicks off a new ~5h40m session every 6 hours
   workflow_dispatch: {}
 
 concurrency:
